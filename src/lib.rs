@@ -1,4 +1,4 @@
-//! # `sigchld`
+//! # `sigchld` [![Actions Status](https://github.com/oconnor663/sigchld.rs/workflows/tests/badge.svg)](https://github.com/oconnor663/sigchld.rs/actions) [![crates.io](https://img.shields.io/crates/v/sigchld.svg)](https://crates.io/crates/sigchld) [![docs.rs](https://docs.rs/sigchld/badge.svg)](https://docs.rs/sigchld)
 //!
 //! This is a low-level utility for child process management. Unix doesn't provide a portable\* API
 //! for waiting for a child process to exit **with a timeout**. The closest thing is waiting for

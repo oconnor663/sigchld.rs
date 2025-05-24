@@ -1,7 +1,9 @@
+use std::ffi::c_int;
 use std::io::{self, ErrorKind, Read};
 use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
 use std::sync::{Condvar, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 static STATE: Mutex<State> = Mutex::new(State::NoOneIsWaiting);
 static CONDVAR: Condvar = Condvar::new();
@@ -48,19 +50,74 @@ pub fn init() -> Result<()> {
     Ok(())
 }
 
-/// Block the current thread until any `SIGCHLD` signal arrives.
+/// Block the current thread until either any `SIGCHLD` signal arrives.
 ///
-/// Spurious wakeups are possible, so even if you know there's only one child process, that process
-/// could still be running after this function returns. This does not reap any exited children.
+/// Signals are buffered, and this function will return immediately if any signals have arrived
+/// since the last time it was called, even if that was a long time ago. Spurious wakeups are also
+/// possible. For both those reasons, you usually need to call this in a loop and poll your child
+/// process each time it returns.
+///
+/// This function does not reap any exited children. Child process cleanup is only done by
+/// [`Child::wait`] or [`Child::try_wait`].
+///
+/// [`Child::wait`]: https://doc.rust-lang.org/std/process/struct.Child.html#method.wait
+/// [`Child::try_wait`]: https://doc.rust-lang.org/std/process/struct.Child.html#method.try_wait
 pub fn wait() -> Result<()> {
+    wait_inner(None).map(|signal_arrived| debug_assert!(signal_arrived))
+}
+
+/// Block the current thread until either any `SIGCHLD` signal arrives, or `timeout` passes.
+/// Returns `true` if a signal arrived before the timeout.
+///
+/// Signals are buffered, and this function will return immediately if any signals have arrived
+/// since the last time it was called, even if that was a long time ago. Spurious wakeups are also
+/// possible. For both those reasons, you usually need to call this in a loop and poll your child
+/// process each time it returns.
+///
+/// This function does not reap any exited children. Child process cleanup is only done by
+/// [`Child::wait`] or [`Child::try_wait`].
+///
+/// [`Child::wait`]: https://doc.rust-lang.org/std/process/struct.Child.html#method.wait
+/// [`Child::try_wait`]: https://doc.rust-lang.org/std/process/struct.Child.html#method.try_wait
+pub fn wait_timeout(timeout: Duration) -> Result<bool> {
+    let deadline = Instant::now() + timeout;
+    wait_inner(Some(deadline))
+}
+
+/// Block the current thread until either any `SIGCHLD` signal arrives, or `deadline` passes.
+/// Returns `true` if a signal arrived before the deadline.
+///
+/// Signals are buffered, and this function will return immediately if any signals have arrived
+/// since the last time it was called, even if that was a long time ago. Spurious wakeups are also
+/// possible. For both those reasons, you usually need to call this in a loop and poll your child
+/// process each time it returns.
+///
+/// This function does not reap any exited children. Child process cleanup is only done by
+/// [`Child::wait`] or [`Child::try_wait`].
+///
+/// [`Child::wait`]: https://doc.rust-lang.org/std/process/struct.Child.html#method.wait
+/// [`Child::try_wait`]: https://doc.rust-lang.org/std/process/struct.Child.html#method.try_wait
+pub fn wait_deadline(deadline: Instant) -> Result<bool> {
+    wait_inner(Some(deadline))
+}
+
+fn wait_inner(maybe_deadline: Option<Instant>) -> Result<bool> {
     let mut guard = STATE.lock().unwrap();
     if matches!(*guard, State::SomeoneIsWaiting) {
         // Another thread is already blocking on SIGCHLD_READER. Wait for them to wake us up.
         // Spurious wakeups are allowed, so we don't need to do this in a loop.
-        guard = CONDVAR.wait(guard).unwrap();
-        drop(guard); // silence warnings
-        return Ok(());
+        if let Some(deadline) = maybe_deadline {
+            let timeout = deadline.saturating_duration_since(Instant::now());
+            let (guard, timeout_result) = CONDVAR.wait_timeout(guard, timeout).unwrap();
+            drop(guard); // silence warnings
+            return Ok(!timeout_result.timed_out());
+        } else {
+            let guard = CONDVAR.wait(guard).unwrap();
+            drop(guard); // silence warnings
+            return Ok(true);
+        }
     }
+
     // We're the thread that needs to poll SIGCHLD_READER. Set the SomeoneIsWaiting state while we
     // do this, and unlock the state mutex so that other threads can observe the state in the
     // meantime. After doing this, we *must* unset the state before exiting. No short-circuiting
@@ -69,7 +126,7 @@ pub fn wait() -> Result<()> {
     drop(guard);
 
     // The real work happens here. We can't short-circuit in this critical section.
-    let wait_result = wait_inner();
+    let wait_result = wait_short_circuitable(maybe_deadline);
 
     // Regardless of whether wait_inner succeeded or failed, reacquire the state mutex, exit the
     // SomeoneIsWaiting state, and wake up everyone who's sleeping on the condvar.
@@ -80,20 +137,26 @@ pub fn wait() -> Result<()> {
 }
 
 // Within this function we can short-circuit. The caller manages state cleanup.
-fn wait_inner() -> Result<()> {
+fn wait_short_circuitable(maybe_deadline: Option<Instant>) -> Result<bool> {
     let mut reader = SIGCHLD_READER.get().expect("init must have been called");
-    // Wait until the pipe is readable.
+    // Wait until the pipe is readable or the deadline passes.
     let mut poll_fd = libc::pollfd {
         fd: reader.as_raw_fd(),
         events: libc::POLLIN,
         revents: 0,
     };
     loop {
+        let timeout_ms: c_int = if let Some(deadline) = maybe_deadline {
+            let timeout = deadline.saturating_duration_since(Instant::now());
+            timeout.as_millis().try_into().unwrap_or(c_int::MAX)
+        } else {
+            -1 // infinite timeout
+        };
         let error_code = unsafe {
             libc::poll(
                 &mut poll_fd, // an "array" of one
                 1,            // the "array" length
-                -1,           // infinite timeout
+                timeout_ms,
             )
         };
         if error_code < 0 {
@@ -122,12 +185,18 @@ fn wait_inner() -> Result<()> {
                 Err(e) => return Err(e.into()),
             }
         }
-        // If we read anything, we were signaled, and we should return. If not, poll must've woken
-        // up spuriously. We're allowed to wake up spuriously too, so we could return in that case,
-        // but go ahead and keep looping.
+        // If we read anything, we were signaled, and we should return. If not, check the clock to
+        // see if we've timed out. Otherwise keep looping.
         if did_read_anything {
-            return Ok(());
+            // A signal arrived.
+            return Ok(true);
+        } else if let Some(deadline) = maybe_deadline {
+            if Instant::now() > deadline {
+                // The deadline passed.
+                return Ok(false);
+            }
         }
+        // Otherwise we must've woken up spuriously. Keep looping.
     }
 }
 
@@ -142,7 +211,7 @@ mod test {
     static ONE_TEST_AT_A_TIME: Mutex<()> = Mutex::new(());
 
     #[track_caller]
-    fn assert_eq_time(dur1: Duration, dur2: Duration) {
+    fn assert_approx_eq(dur1: Duration, dur2: Duration) {
         const CLOSE_ENOUGH: f64 = 0.1; // 10%
         let lower_bound = 1.0 - CLOSE_ENOUGH;
         let upper_bound = 1.0 + CLOSE_ENOUGH;
@@ -162,7 +231,89 @@ mod test {
         cmd!("sleep", "0.25").start()?;
         wait()?;
         let dur = Instant::now() - start;
-        assert_eq_time(Duration::from_millis(250), dur);
+        assert_approx_eq(Duration::from_millis(250), dur);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_wait_deadline() -> Result<()> {
+        init()?; // let all the tests race to init, why not
+        let _test_guard = ONE_TEST_AT_A_TIME.lock().unwrap();
+        let start = Instant::now();
+
+        cmd!("sleep", "0.25").start()?;
+        let timeout = Duration::from_millis(500);
+        // This first wait should return true.
+        let signaled = wait_deadline(Instant::now() + timeout)?;
+        let dur = Instant::now() - start;
+        assert_approx_eq(Duration::from_millis(250), dur);
+        assert!(signaled);
+
+        // This second wait should time out and return false.
+        let signaled2 = wait_deadline(Instant::now() + timeout)?;
+        let dur2 = Instant::now() - start;
+        assert_approx_eq(Duration::from_millis(750), dur2);
+        assert!(!signaled2);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_wait_timeout() -> Result<()> {
+        init()?; // let all the tests race to init, why not
+        let _test_guard = ONE_TEST_AT_A_TIME.lock().unwrap();
+        let start = Instant::now();
+
+        cmd!("sleep", "0.25").start()?;
+        let timeout = Duration::from_millis(500);
+        // This first wait should return true.
+        let signaled = wait_timeout(timeout)?;
+        let dur = Instant::now() - start;
+        assert_approx_eq(Duration::from_millis(250), dur);
+        assert!(signaled);
+
+        // This second wait should time out and return false.
+        let signaled2 = wait_timeout(timeout)?;
+        let dur2 = Instant::now() - start;
+        assert_approx_eq(Duration::from_millis(750), dur2);
+        assert!(!signaled2);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_wait_many_threads() -> Result<()> {
+        init()?; // let all the tests race to init, why not
+        let _test_guard = ONE_TEST_AT_A_TIME.lock().unwrap();
+        let start = Instant::now();
+
+        cmd!("sleep", "0.25").start()?;
+        let mut wait_threads = Vec::new();
+        let mut short_timeout_threads = Vec::new();
+        let mut long_timeout_threads = Vec::new();
+        for _ in 0..4 {
+            wait_threads.push(std::thread::spawn(move || -> Result<Duration> {
+                wait()?;
+                Ok(Instant::now() - start)
+            }));
+            short_timeout_threads.push(std::thread::spawn(move || -> Result<bool> {
+                wait_timeout(Duration::from_millis(100))
+            }));
+            long_timeout_threads.push(std::thread::spawn(move || -> Result<bool> {
+                wait_timeout(Duration::from_millis(400))
+            }));
+        }
+        for thread in wait_threads {
+            let dur = thread.join().unwrap()?;
+            assert_approx_eq(Duration::from_millis(250), dur);
+        }
+        for thread in short_timeout_threads {
+            assert!(!thread.join().unwrap()?, "should not be signaled");
+        }
+        for thread in long_timeout_threads {
+            assert!(thread.join().unwrap()?, "should be signaled");
+        }
 
         Ok(())
     }

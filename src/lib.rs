@@ -13,9 +13,15 @@ enum State {
 
 static SIGCHLD_READER: OnceLock<UnixStream> = OnceLock::new();
 
+// Use anyhow errors in testing, for backtraces.
+#[cfg(test)]
+type Result<T> = anyhow::Result<T>;
+#[cfg(not(test))]
+type Result<T> = io::Result<T>;
+
 /// Some thread must call `init` (successfully) before any thread calls [`wait`] or
 /// [`wait_timeout`].
-pub fn init() -> io::Result<()> {
+pub fn init() -> Result<()> {
     // Double-check locking. The first check is the already-initialized fast path.
     if SIGCHLD_READER.get().is_some() {
         return Ok(());
@@ -46,7 +52,7 @@ pub fn init() -> io::Result<()> {
 ///
 /// Spurious wakeups are possible, so even if you know there's only one child process, that process
 /// could still be running after this function returns. This does not reap any exited children.
-pub fn wait() -> io::Result<()> {
+pub fn wait() -> Result<()> {
     let mut guard = STATE.lock().unwrap();
     if matches!(*guard, State::SomeoneIsWaiting) {
         // Another thread is already blocking on SIGCHLD_READER. Wait for them to wake us up.
@@ -74,7 +80,7 @@ pub fn wait() -> io::Result<()> {
 }
 
 // Within this function we can short-circuit. The caller manages state cleanup.
-fn wait_inner() -> io::Result<()> {
+fn wait_inner() -> Result<()> {
     let mut reader = SIGCHLD_READER.get().expect("init must have been called");
     // Wait until the pipe is readable.
     let mut poll_fd = libc::pollfd {
@@ -82,27 +88,82 @@ fn wait_inner() -> io::Result<()> {
         events: libc::POLLIN,
         revents: 0,
     };
-    let error_code = unsafe {
-        libc::poll(
-            &mut poll_fd, // an "array" of one
-            1,            // the "array" length
-            -1,           // infinite timeout
-        )
-    };
-    if error_code < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    // Read the pipe until EWOULDBLOCK. This could take more than one read.
-    let mut buf = [0u8; 1024];
     loop {
-        match reader.read(&mut buf) {
-            Ok(0) => unreachable!("this pipe should never close"),
-            Ok(_) => continue,
-            Err(e) if e.kind() == ErrorKind::WouldBlock => break,
-            // EINTR should not be possible for a nonblocking read.
-            Err(e) => return Err(e),
+        let error_code = unsafe {
+            libc::poll(
+                &mut poll_fd, // an "array" of one
+                1,            // the "array" length
+                -1,           // infinite timeout
+            )
+        };
+        if error_code < 0 {
+            // EINTR is expected here. If we're the only running thread, then we're the only thread
+            // that can handle SIGCHLD, so it's probably even guaranteed. We don't *have* to loop,
+            // because spurious wakeups are allowed, but it would be bad behavior to wake the caller
+            // for unrelated signals.
+            let e = io::Error::last_os_error();
+            if e.kind() == ErrorKind::Interrupted {
+                continue;
+            } else {
+                #[allow(clippy::useless_conversion)]
+                return Err(io::Error::last_os_error().into());
+            }
+        }
+        // Read the pipe until EWOULDBLOCK. This could take more than one read.
+        let mut buf = [0u8; 1024];
+        let mut did_read_anything = false;
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) => unreachable!("this pipe should never close"),
+                Ok(_) => did_read_anything = true,
+                Err(e) if e.kind() == ErrorKind::WouldBlock => break,
+                // EINTR should not be possible for a nonblocking read.
+                #[allow(clippy::useless_conversion)]
+                Err(e) => return Err(e.into()),
+            }
+        }
+        // If we read anything, we were signaled, and we should return. If not, poll must've woken
+        // up spuriously. We're allowed to wake up spuriously too, so we could return in that case,
+        // but go ahead and keep looping.
+        if did_read_anything {
+            return Ok(());
         }
     }
-    // Either we were signaled, or we woke up spuriously. We don't distinguish.
-    Ok(())
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use duct::cmd;
+    use std::time::{Duration, Instant};
+
+    // We need to make sure only one test runs at a time, because these waits are global, and
+    // they'll confuse each other.
+    static ONE_TEST_AT_A_TIME: Mutex<()> = Mutex::new(());
+
+    #[track_caller]
+    fn assert_eq_time(dur1: Duration, dur2: Duration) {
+        const CLOSE_ENOUGH: f64 = 0.1; // 10%
+        let lower_bound = 1.0 - CLOSE_ENOUGH;
+        let upper_bound = 1.0 + CLOSE_ENOUGH;
+        let ratio = dur1.as_secs_f64() / dur2.as_secs_f64();
+        assert!(
+            lower_bound < ratio && ratio < upper_bound,
+            "{dur1:?} and {dur2:?} are not close enough",
+        );
+    }
+
+    #[test]
+    fn test_wait() -> Result<()> {
+        init()?; // let all the tests race to init, why not
+        let _test_guard = ONE_TEST_AT_A_TIME.lock().unwrap();
+        let start = Instant::now();
+
+        cmd!("sleep", "0.25").start()?;
+        wait()?;
+        let dur = Instant::now() - start;
+        assert_eq_time(Duration::from_millis(250), dur);
+
+        Ok(())
+    }
 }

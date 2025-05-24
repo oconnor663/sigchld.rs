@@ -21,12 +21,10 @@ type Result<T> = anyhow::Result<T>;
 #[cfg(not(test))]
 type Result<T> = io::Result<T>;
 
-/// Some thread must call `init` (successfully) before any thread calls [`wait`] or
-/// [`wait_timeout`].
-pub fn init() -> Result<()> {
+fn get_or_init_reader() -> Result<&'static UnixStream> {
     // Double-check locking. The first check is the already-initialized fast path.
-    if SIGCHLD_READER.get().is_some() {
-        return Ok(());
+    if let Some(reader) = SIGCHLD_READER.get() {
+        return Ok(reader);
     }
 
     // Take the state mutex, so that only one thread tries to initialize the pipe at a time. We
@@ -35,8 +33,8 @@ pub fn init() -> Result<()> {
     let _guard = STATE.lock().unwrap();
 
     // Check again, because two threads could've raced to take the lock.
-    if SIGCHLD_READER.get().is_some() {
-        return Ok(());
+    if let Some(reader) = SIGCHLD_READER.get() {
+        return Ok(reader);
     }
 
     // Open and register the pipe. We could use a regular pipe instead of a Unix socket, but the
@@ -47,7 +45,7 @@ pub fn init() -> Result<()> {
     writer.set_nonblocking(true)?;
     signal_hook::low_level::pipe::register(signal_hook::consts::SIGCHLD, writer)?;
     SIGCHLD_READER.set(reader).expect("only 1 thread gets here");
-    Ok(())
+    Ok(SIGCHLD_READER.get().unwrap())
 }
 
 /// Block the current thread until either any `SIGCHLD` signal arrives.
@@ -63,16 +61,19 @@ pub fn init() -> Result<()> {
 /// [`Child::wait`]: https://doc.rust-lang.org/std/process/struct.Child.html#method.wait
 /// [`Child::try_wait`]: https://doc.rust-lang.org/std/process/struct.Child.html#method.try_wait
 pub fn wait() -> Result<()> {
-    wait_inner(None).map(|signal_arrived| debug_assert!(signal_arrived))
+    let signaled = wait_inner(None)?;
+    debug_assert!(signaled, "timeout shouldn't be possible");
+    Ok(())
 }
 
-/// Block the current thread until either any `SIGCHLD` signal arrives, or `timeout` passes.
-/// Returns `true` if a signal arrived before the timeout.
+/// Block the current thread until either any `SIGCHLD` signal arrives or a timeout passes. Returns
+/// `true` if a signal arrived before the timeout.
 ///
 /// Signals are buffered, and this function will return immediately if any signals have arrived
 /// since the last time it was called, even if that was a long time ago. Spurious wakeups are also
 /// possible. For both those reasons, you usually need to call this in a loop and poll your child
-/// process each time it returns.
+/// process each time it returns. [`wait_deadline`] can be more convenient, since you don't need to
+/// decrement your timeout each time through the loop.
 ///
 /// This function does not reap any exited children. Child process cleanup is only done by
 /// [`Child::wait`] or [`Child::try_wait`].
@@ -84,7 +85,7 @@ pub fn wait_timeout(timeout: Duration) -> Result<bool> {
     wait_inner(Some(deadline))
 }
 
-/// Block the current thread until either any `SIGCHLD` signal arrives, or `deadline` passes.
+/// Block the current thread until either any `SIGCHLD` signal arrives or a deadline passes.
 /// Returns `true` if a signal arrived before the deadline.
 ///
 /// Signals are buffered, and this function will return immediately if any signals have arrived
@@ -138,7 +139,7 @@ fn wait_inner(maybe_deadline: Option<Instant>) -> Result<bool> {
 
 // Within this function we can short-circuit. The caller manages state cleanup.
 fn wait_short_circuitable(maybe_deadline: Option<Instant>) -> Result<bool> {
-    let mut reader = SIGCHLD_READER.get().expect("init must have been called");
+    let mut reader = get_or_init_reader()?;
     // Wait until the pipe is readable or the deadline passes.
     let mut poll_fd = libc::pollfd {
         fd: reader.as_raw_fd(),
@@ -224,7 +225,6 @@ mod test {
 
     #[test]
     fn test_wait() -> Result<()> {
-        init()?; // let all the tests race to init, why not
         let _test_guard = ONE_TEST_AT_A_TIME.lock().unwrap();
         let start = Instant::now();
 
@@ -238,7 +238,6 @@ mod test {
 
     #[test]
     fn test_wait_deadline() -> Result<()> {
-        init()?; // let all the tests race to init, why not
         let _test_guard = ONE_TEST_AT_A_TIME.lock().unwrap();
         let start = Instant::now();
 
@@ -261,7 +260,6 @@ mod test {
 
     #[test]
     fn test_wait_timeout() -> Result<()> {
-        init()?; // let all the tests race to init, why not
         let _test_guard = ONE_TEST_AT_A_TIME.lock().unwrap();
         let start = Instant::now();
 
@@ -284,7 +282,6 @@ mod test {
 
     #[test]
     fn test_wait_many_threads() -> Result<()> {
-        init()?; // let all the tests race to init, why not
         let _test_guard = ONE_TEST_AT_A_TIME.lock().unwrap();
         let start = Instant::now();
 

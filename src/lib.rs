@@ -239,7 +239,11 @@ fn wait_short_circuitable(maybe_deadline: Option<Instant>) -> Result<bool> {
     loop {
         let timeout_ms: c_int = if let Some(deadline) = maybe_deadline {
             let timeout = deadline.saturating_duration_since(Instant::now());
-            timeout.as_millis().try_into().unwrap_or(c_int::MAX)
+            // Convert to milliseconds, rounding *up*. (That way we don't repeatedly sleep for 0ms
+            // when we're close to the timeout.)
+            (timeout.as_nanos().saturating_add(999_999) / 1_000_000)
+                .try_into()
+                .unwrap_or(c_int::MAX)
         } else {
             -1 // infinite timeout
         };

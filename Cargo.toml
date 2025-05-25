@@ -16,4 +16,5 @@ signal-hook = { version = "0.3.18", default-features = false }
 [dev-dependencies]
 anyhow = "1.0.98"
 duct = "1.0.0"
+parking_lot = "0.12.3"
 rand = "0.9.1"

@@ -299,8 +299,8 @@ mod test {
     use std::time::{Duration, Instant};
 
     // We need to make sure only one test runs at a time, because these waits are global, and
-    // they'll confuse each other.
-    static ONE_TEST_AT_A_TIME: Mutex<()> = Mutex::new(());
+    // they'll confuse each other. Use a parking_lot mutex so that it doesn't get poisoned.
+    static ONE_TEST_AT_A_TIME: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
 
     #[track_caller]
     fn assert_approx_eq(dur1: Duration, dur2: Duration) {
@@ -317,7 +317,7 @@ mod test {
     #[test]
     fn test_wait() -> Result<()> {
         init()?; // Make all tests race to init, why not.
-        let _test_guard = ONE_TEST_AT_A_TIME.lock().unwrap();
+        let _test_guard = ONE_TEST_AT_A_TIME.lock();
         let start = Instant::now();
 
         cmd!("sleep", "0.25").start()?;
@@ -331,7 +331,7 @@ mod test {
     #[test]
     fn test_wait_deadline() -> Result<()> {
         init()?; // Make all tests race to init, why not.
-        let _test_guard = ONE_TEST_AT_A_TIME.lock().unwrap();
+        let _test_guard = ONE_TEST_AT_A_TIME.lock();
         let start = Instant::now();
 
         cmd!("sleep", "0.25").start()?;
@@ -354,7 +354,7 @@ mod test {
     #[test]
     fn test_wait_timeout() -> Result<()> {
         init()?; // Make all tests race to init, why not.
-        let _test_guard = ONE_TEST_AT_A_TIME.lock().unwrap();
+        let _test_guard = ONE_TEST_AT_A_TIME.lock();
         let start = Instant::now();
 
         cmd!("sleep", "0.25").start()?;
@@ -377,7 +377,7 @@ mod test {
     #[test]
     fn test_wait_many_threads() -> Result<()> {
         init()?; // Make all tests race to init, why not.
-        let _test_guard = ONE_TEST_AT_A_TIME.lock().unwrap();
+        let _test_guard = ONE_TEST_AT_A_TIME.lock();
         let start = Instant::now();
 
         let handle = Arc::new(cmd!("sleep", "1").start()?);

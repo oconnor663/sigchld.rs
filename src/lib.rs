@@ -14,6 +14,33 @@
 //!
 //! \* Linux supports `signalfd`, but there's no equivalent on e.g. macOS.
 //!
+//! # Example
+//!
+//! ```rust
+//! # fn main() -> std::io::Result<()> {
+//! # use std::time::Duration;
+//! // Start a child process that waits a random number of seconds.
+//! let seconds: u32 = rand::random_range(1..=3);
+//! println!("sleeping for {seconds} sec");
+//! std::process::Command::new("sleep").arg(format!("{seconds}")).spawn()?;
+//!
+//! // Calling init at least once is mandatory.
+//! sigchld::init()?;
+//!
+//! // Wait up to 2 seconds for *any* child to exit. In this example `sleep` is the only child
+//! // process, but in general we won't necessarily know which child woke us up.
+//! let signaled: bool = sigchld::wait_timeout(Duration::from_secs(2))?;
+//!
+//! if signaled {
+//!     // In *this example* we know that the signal came from `sleep`.
+//!     println!("sleep exited before the timeout");
+//! } else {
+//!     println!("sleep was still running when the timeout expired");
+//! }
+//! # Ok(())
+//! # }
+//! ```
+//!
 //! [`signal_hook`]: https://docs.rs/signal-hook
 //! [try_wait]: https://doc.rust-lang.org/std/process/struct.Child.html#method.try_wait
 
@@ -268,6 +295,7 @@ fn wait_short_circuitable(maybe_deadline: Option<Instant>) -> Result<bool> {
 mod test {
     use super::*;
     use duct::cmd;
+    use std::sync::Arc;
     use std::time::{Duration, Instant};
 
     // We need to make sure only one test runs at a time, because these waits are global, and
@@ -352,25 +380,34 @@ mod test {
         let _test_guard = ONE_TEST_AT_A_TIME.lock().unwrap();
         let start = Instant::now();
 
-        cmd!("sleep", "0.25").start()?;
+        let handle = Arc::new(cmd!("sleep", "1").start()?);
         let mut wait_threads = Vec::new();
         let mut short_timeout_threads = Vec::new();
         let mut long_timeout_threads = Vec::new();
         for _ in 0..4 {
+            let handle_clone = handle.clone();
             wait_threads.push(std::thread::spawn(move || -> Result<Duration> {
                 wait()?;
-                Ok(Instant::now() - start)
+                let dur = Instant::now() - start;
+                assert!(handle_clone.try_wait()?.is_some(), "should've exited");
+                Ok(dur)
             }));
+            let handle_clone = handle.clone();
             short_timeout_threads.push(std::thread::spawn(move || -> Result<bool> {
-                wait_timeout(Duration::from_millis(100))
+                let signaled = wait_timeout(Duration::from_millis(500))?;
+                assert!(handle_clone.try_wait()?.is_none(), "shouldn't have exited");
+                Ok(signaled)
             }));
+            let handle_clone = handle.clone();
             long_timeout_threads.push(std::thread::spawn(move || -> Result<bool> {
-                wait_timeout(Duration::from_millis(400))
+                let signaled = wait_timeout(Duration::from_millis(1500))?;
+                assert!(handle_clone.try_wait()?.is_some(), "should've exited");
+                Ok(signaled)
             }));
         }
         for thread in wait_threads {
             let dur = thread.join().unwrap()?;
-            assert_approx_eq(Duration::from_millis(250), dur);
+            assert_approx_eq(Duration::from_millis(1000), dur);
         }
         for thread in short_timeout_threads {
             assert!(!thread.join().unwrap()?, "should not be signaled");

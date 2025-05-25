@@ -40,10 +40,39 @@ type Result<T> = anyhow::Result<T>;
 #[cfg(not(test))]
 type Result<T> = io::Result<T>;
 
-fn get_or_init_reader() -> Result<&'static UnixStream> {
+/// Set up the `SIGCHLD` handler. This must be called at least once before any other function in
+/// this crate. Additional calls are safe and have no effect.
+///
+/// There's a correctness reason that init isn't called automatically for you. Consider the
+/// following series of events:
+///
+/// 1. You poll a child process with [`Child::try_wait`] to see whether it has exited. You get
+///    `Ok(None)`, indicating that the child is still running.
+/// 2. Immediately after that, the child actually exits. Your process receives `SIGCHLD`, but no
+///    handler is installed.
+/// 3. You then call [`sigchld::wait`] to wait for any child to exit. It hasn't been called before,
+///    so it installs the signal handler, but it's too late to catch the `SIGCHLD` in step
+///    2. You block forever.
+///
+/// Making `init` a separate function allows for the following, more robust order of events:
+///
+/// 1. You call `init` and install the signal handler.
+/// 2. You poll the child. Let's say you get `Ok(None)` again.
+/// 3. As above, the child immediately exits. Your process receives `SIGCHLD`, but this time the
+///    installed handler receives the signal and _buffers_ it in a pipe.
+/// 4. You call [`sigchld::wait`], which reads a byte from the pipe and immediately reports
+///    that the child has exited.
+///
+/// You can still get a deadlock if you do poll-`init`-[`sigchld::wait`] instead of
+/// `init`-poll-[`sigchld::wait`], so this API isn't bulletproof. Please remember to `init` before
+/// you poll.
+///
+/// [`sigchld::wait`]: [wait]
+/// [`Child::try_wait`]: https://doc.rust-lang.org/std/process/struct.Child.html#method.try_wait
+pub fn init() -> Result<()> {
     // Double-check locking. The first check is the already-initialized fast path.
-    if let Some(reader) = SIGCHLD_READER.get() {
-        return Ok(reader);
+    if SIGCHLD_READER.get().is_some() {
+        return Ok(());
     }
 
     // Take the state mutex, so that only one thread tries to initialize the pipe at a time. We
@@ -52,8 +81,8 @@ fn get_or_init_reader() -> Result<&'static UnixStream> {
     let _guard = STATE.lock().unwrap();
 
     // Check again, because two threads could've raced to take the lock.
-    if let Some(reader) = SIGCHLD_READER.get() {
-        return Ok(reader);
+    if SIGCHLD_READER.get().is_some() {
+        return Ok(());
     }
 
     // Open and register the pipe. We could use a regular pipe instead of a Unix socket, but the
@@ -64,7 +93,7 @@ fn get_or_init_reader() -> Result<&'static UnixStream> {
     writer.set_nonblocking(true)?;
     signal_hook::low_level::pipe::register(signal_hook::consts::SIGCHLD, writer)?;
     SIGCHLD_READER.set(reader).expect("only 1 thread gets here");
-    Ok(SIGCHLD_READER.get().unwrap())
+    Ok(())
 }
 
 /// Block the current thread until either any `SIGCHLD` signal arrives.
@@ -76,6 +105,11 @@ fn get_or_init_reader() -> Result<&'static UnixStream> {
 ///
 /// This function does not reap any exited children. Child process cleanup is only done by
 /// [`Child::wait`] or [`Child::try_wait`].
+///
+/// # Panics
+///
+/// You must call [`init`] at least once before you call this function. If [`init`] has not been
+/// called, this function panics.
 ///
 /// [`Child::wait`]: https://doc.rust-lang.org/std/process/struct.Child.html#method.wait
 /// [`Child::try_wait`]: https://doc.rust-lang.org/std/process/struct.Child.html#method.try_wait
@@ -97,6 +131,11 @@ pub fn wait() -> Result<()> {
 /// This function does not reap any exited children. Child process cleanup is only done by
 /// [`Child::wait`] or [`Child::try_wait`].
 ///
+/// # Panics
+///
+/// You must call [`init`] at least once before you call this function. If [`init`] has not been
+/// called, this function panics.
+///
 /// [`Child::wait`]: https://doc.rust-lang.org/std/process/struct.Child.html#method.wait
 /// [`Child::try_wait`]: https://doc.rust-lang.org/std/process/struct.Child.html#method.try_wait
 pub fn wait_timeout(timeout: Duration) -> Result<bool> {
@@ -114,6 +153,11 @@ pub fn wait_timeout(timeout: Duration) -> Result<bool> {
 ///
 /// This function does not reap any exited children. Child process cleanup is only done by
 /// [`Child::wait`] or [`Child::try_wait`].
+///
+/// # Panics
+///
+/// You must call [`init`] at least once before you call this function. If [`init`] has not been
+/// called, this function panics.
 ///
 /// [`Child::wait`]: https://doc.rust-lang.org/std/process/struct.Child.html#method.wait
 /// [`Child::try_wait`]: https://doc.rust-lang.org/std/process/struct.Child.html#method.try_wait
@@ -158,7 +202,7 @@ fn wait_inner(maybe_deadline: Option<Instant>) -> Result<bool> {
 
 // Within this function we can short-circuit. The caller manages state cleanup.
 fn wait_short_circuitable(maybe_deadline: Option<Instant>) -> Result<bool> {
-    let mut reader = get_or_init_reader()?;
+    let mut reader = SIGCHLD_READER.get().expect("you must call init first");
     // Wait until the pipe is readable or the deadline passes.
     let mut poll_fd = libc::pollfd {
         fd: reader.as_raw_fd(),
@@ -244,6 +288,7 @@ mod test {
 
     #[test]
     fn test_wait() -> Result<()> {
+        init()?; // Make all tests race to init, why not.
         let _test_guard = ONE_TEST_AT_A_TIME.lock().unwrap();
         let start = Instant::now();
 
@@ -257,6 +302,7 @@ mod test {
 
     #[test]
     fn test_wait_deadline() -> Result<()> {
+        init()?; // Make all tests race to init, why not.
         let _test_guard = ONE_TEST_AT_A_TIME.lock().unwrap();
         let start = Instant::now();
 
@@ -279,6 +325,7 @@ mod test {
 
     #[test]
     fn test_wait_timeout() -> Result<()> {
+        init()?; // Make all tests race to init, why not.
         let _test_guard = ONE_TEST_AT_A_TIME.lock().unwrap();
         let start = Instant::now();
 
@@ -301,6 +348,7 @@ mod test {
 
     #[test]
     fn test_wait_many_threads() -> Result<()> {
+        init()?; // Make all tests race to init, why not.
         let _test_guard = ONE_TEST_AT_A_TIME.lock().unwrap();
         let start = Instant::now();
 

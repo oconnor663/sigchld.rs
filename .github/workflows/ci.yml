@@ -27,7 +27,8 @@ jobs:
       with:
         toolchain: ${{ matrix.rust_channel }}
     # macOS does "timer coalescing" by default, which can add ~100ms to wakeup
-    # times and cause tests to fail.
+    # times and cause tests to fail. To be honest, I'm not exactly sure where
+    # this happens (child wakeup vs SIGCHLD delivery vs poll return).
     - name: disable timer coalescing on macOS
       run: sudo sysctl -w kern.timer.coalescing_enabled=0
       if: matrix.os == 'macOS-latest'

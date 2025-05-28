@@ -26,9 +26,4 @@ jobs:
     - uses: dtolnay/rust-toolchain@master
       with:
         toolchain: ${{ matrix.rust_channel }}
-    # macOS does "timer coalescing" by default, which can add ~100ms to wakeup
-    # times and cause tests to fail.
-    - name: disable timer coalescing on macOS
-      run: sudo sysctl -w kern.timer.coalescing_enabled=0
-      if: matrix.os == 'macOS-latest'
     - run: cargo test

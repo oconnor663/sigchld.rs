@@ -389,7 +389,6 @@ fn lock_no_poison<T>(mutex: &Mutex<T>) -> MutexGuard<T> {
 #[cfg(test)]
 mod test {
     use super::*;
-    use duct::cmd;
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
@@ -414,13 +413,26 @@ mod test {
         );
     }
 
+    fn spawn_sleep(duration: &str) -> Result<duct::Handle> {
+        const PYTHON_CODE: &str = r#"
+import sys
+import time
+sleep_time = float(sys.argv[1])
+start = time.monotonic()
+while time.monotonic() < start + sleep_time:
+    pass
+"#;
+        let child = duct::cmd!("python", "-c", PYTHON_CODE, duration).start()?;
+        Ok(child)
+    }
+
     #[test]
     fn test_wait() -> Result<()> {
         let _test_guard = lock_no_poison(&ONE_TEST_AT_A_TIME); // see comment on the lock
         let start = Instant::now();
 
         let waiter = Waiter::new()?;
-        cmd!("sleep", "0.25").start()?;
+        spawn_sleep("0.25")?;
         waiter.wait()?;
         let dur = Instant::now() - start;
         assert_approx_eq(Duration::from_millis(250), dur);
@@ -435,7 +447,7 @@ mod test {
 
         let timeout = Duration::from_millis(500);
         let waiter = Waiter::new()?;
-        cmd!("sleep", "0.25").start()?;
+        spawn_sleep("0.25")?;
         // This first wait should return true.
         let signaled = waiter.wait_deadline(Instant::now() + timeout)?;
         let dur = Instant::now() - start;
@@ -459,7 +471,7 @@ mod test {
 
         let timeout = Duration::from_millis(500);
         let waiter = Waiter::new()?;
-        cmd!("sleep", "0.25").start()?;
+        spawn_sleep("0.25")?;
         // This first wait should return true.
         let signaled = waiter.wait_timeout(timeout)?;
         let dur = Instant::now() - start;
@@ -481,7 +493,7 @@ mod test {
         let _test_guard = lock_no_poison(&ONE_TEST_AT_A_TIME); // see comment on the lock
         let start = Instant::now();
 
-        let handle = Arc::new(cmd!("sleep", "1").start()?);
+        let handle = Arc::new(spawn_sleep("1")?);
         let mut wait_threads = Vec::new();
         let mut short_timeout_threads = Vec::new();
         let mut long_timeout_threads = Vec::new();

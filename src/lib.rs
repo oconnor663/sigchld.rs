@@ -400,7 +400,7 @@ mod test {
     // wakeups, I'd rather the tests fail than hide the bug. I expect these tests will "randomly"
     // fail under certain circumstances, and that's worth it to me to catch more bugs. But real
     // callers should wait in a loop so that they don't randomly fail.
-    static ONE_TEST_AT_A_TIME: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+    static ONE_TEST_AT_A_TIME: Mutex<()> = Mutex::new(());
 
     #[track_caller]
     fn assert_approx_eq(dur1: Duration, dur2: Duration) {
@@ -416,7 +416,7 @@ mod test {
 
     #[test]
     fn test_wait() -> Result<()> {
-        let _test_guard = ONE_TEST_AT_A_TIME.lock();
+        let _test_guard = lock_no_poison(&ONE_TEST_AT_A_TIME); // see comment on the lock
         let start = Instant::now();
 
         let waiter = Waiter::new()?;
@@ -430,7 +430,7 @@ mod test {
 
     #[test]
     fn test_wait_deadline() -> Result<()> {
-        let _test_guard = ONE_TEST_AT_A_TIME.lock();
+        let _test_guard = lock_no_poison(&ONE_TEST_AT_A_TIME); // see comment on the lock
         let start = Instant::now();
 
         let timeout = Duration::from_millis(500);
@@ -454,7 +454,7 @@ mod test {
 
     #[test]
     fn test_wait_timeout() -> Result<()> {
-        let _test_guard = ONE_TEST_AT_A_TIME.lock();
+        let _test_guard = lock_no_poison(&ONE_TEST_AT_A_TIME); // see comment on the lock
         let start = Instant::now();
 
         let timeout = Duration::from_millis(500);
@@ -478,7 +478,7 @@ mod test {
 
     #[test]
     fn test_wait_many_threads() -> Result<()> {
-        let _test_guard = ONE_TEST_AT_A_TIME.lock();
+        let _test_guard = lock_no_poison(&ONE_TEST_AT_A_TIME); // see comment on the lock
         let start = Instant::now();
 
         let handle = Arc::new(cmd!("sleep", "1").start()?);

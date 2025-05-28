@@ -19,23 +19,23 @@
 //! ```rust
 //! # fn main() -> std::io::Result<()> {
 //! # use std::time::Duration;
-//! // Start a child process that waits a random number of seconds.
-//! let seconds: u32 = rand::random_range(1..=3);
-//! println!("sleeping for {seconds} sec");
-//! std::process::Command::new("sleep").arg(format!("{seconds}")).spawn()?;
+//! // Create a waiter before spawning the child, to guarantee that we don't miss a signal.
+//! let waiter = sigchld::Waiter::new()?;
 //!
-//! // Calling init at least once is mandatory.
-//! sigchld::init()?;
+//! // Start a child process that sleeps for up to 3 seconds.
+//! let sleep_time: f32 = rand::random_range(0.0..=3.0);
+//! println!("Sleeping for {sleep_time:.3} seconds...", );
+//! std::process::Command::new("sleep").arg(format!("{sleep_time}")).spawn()?;
 //!
-//! // Wait up to 2 seconds for *any* child to exit. In this example `sleep` is the only child
+//! // Wait half a second for *any* child to exit. In this example `sleep` is the only child
 //! // process, but in general we won't necessarily know which child woke us up.
-//! let signaled: bool = sigchld::wait_timeout(Duration::from_secs(2))?;
+//! let signaled: bool = waiter.wait_timeout(Duration::from_secs(1))?;
 //!
 //! if signaled {
 //!     // In *this example* we know that the signal came from `sleep`.
-//!     println!("sleep exited before the timeout");
+//!     println!("Sleep exited.");
 //! } else {
-//!     println!("sleep was still running when the timeout expired");
+//!     println!("We gave up waiting after 1 sec.");
 //! }
 //! # Ok(())
 //! # }
@@ -48,16 +48,30 @@ use std::ffi::c_int;
 use std::io::{self, ErrorKind, Read};
 use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
-use std::sync::{Condvar, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, LazyLock, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
-static STATE: Mutex<State> = Mutex::new(State::NoOneIsWaiting);
-static CONDVAR: Condvar = Condvar::new();
-
-enum State {
-    NoOneIsWaiting,
-    SomeoneIsWaiting,
+struct State {
+    someone_is_polling: bool,
+    // Every time a signal is received, we replace the marker. Waiters clone the marker when
+    // they're created, and they compare their clone the with the current marker *by address* to
+    // see if any signals have been received since they were created. Heap addresses won't be
+    // reused while any waiter retains a clone. The value of the byte in the marker doesn't matter,
+    // but we can't use a ZST, because those don't actually get allocated.
+    //
+    // We could've just used a counter, but then in theory a counter could wrap around. And we
+    // don't want Waiters to be Copy anyway, because the wait methods take them by value.
+    signal_marker: Arc<u8>,
 }
+
+static STATE: LazyLock<Mutex<State>> = LazyLock::new(|| {
+    Mutex::new(State {
+        someone_is_polling: false,
+        signal_marker: Arc::new(42), // the value doesn't matter
+    })
+});
+
+static CONDVAR: Condvar = Condvar::new();
 
 static SIGCHLD_READER: OnceLock<UnixStream> = OnceLock::new();
 
@@ -67,176 +81,229 @@ type Result<T> = anyhow::Result<T>;
 #[cfg(not(test))]
 type Result<T> = io::Result<T>;
 
-/// Set up the `SIGCHLD` handler. This must be called at least once before any other function in
-/// this crate. Additional calls are safe and have no effect.
+/// An object that buffers `SIGCHLD` signals so that you can wait on them reliably.
 ///
-/// There's a correctness reason that init isn't called automatically for you. Consider the
-/// following series of events:
+/// There's a required order of operations here:
 ///
-/// 1. You poll a child process with [`Child::try_wait`] to see whether it has exited. You get
-///    `Ok(None)`, indicating that the child is still running.
-/// 2. Immediately after that, the child actually exits. Your process receives `SIGCHLD`, but no
-///    handler is installed.
-/// 3. You then call [`sigchld::wait`] to wait for any child to exit. It hasn't been called before,
-///    so it installs the signal handler, but it's too late to catch the `SIGCHLD` in step
-///    2. You block forever.
+/// 1. Create a `Waiter`.
+/// 2. Poll your child process with [`Child::try_wait`] or similar, to see if it's already exited.
+/// 3. Call [`wait`](Self::wait), [`wait_timeout`](Self::wait_timeout), or
+///    [`wait_deadline`](Self::wait_deadline).
+/// 4. Loop back to step 1.
 ///
-/// Making `init` a separate function allows for the following, more robust order of events:
+/// For example:
 ///
-/// 1. You call `init` and install the signal handler.
-/// 2. You poll the child. Let's say you get `Ok(None)` again.
-/// 3. As above, the child immediately exits. Your process receives `SIGCHLD`, but this time the
-///    installed handler receives the signal and _buffers_ it in a pipe.
-/// 4. You call [`sigchld::wait`], which reads a byte from the pipe and immediately reports
-///    that the child has exited.
+/// ```rust
+/// # use std::io;
+/// # fn main() -> io::Result<()> {
+/// let mut child = std::process::Command::new("sleep").arg("1").spawn()?;
+/// loop {
+///     let waiter = sigchld::Waiter::new()?;
+///     if child.try_wait()?.is_some() {
+///         // The child has exited.
+///         break;
+///     }
+///     waiter.wait()?;
+/// }
+/// # Ok(())
+/// # }
+/// ```
 ///
-/// You can still get a deadlock if you do poll-`init`-[`sigchld::wait`] instead of
-/// `init`-poll-[`sigchld::wait`], so this API isn't bulletproof. Please remember to `init` before
-/// you poll.
+/// If you don't create the `Waiter` _before_ polling the child, then a signal delivered
+/// immediately after you poll could get missed, and you could wait forever.
 ///
-/// [`sigchld::wait`]: [wait]
 /// [`Child::try_wait`]: https://doc.rust-lang.org/std/process/struct.Child.html#method.try_wait
-pub fn init() -> Result<()> {
-    // Double-check locking. The first check is the already-initialized fast path.
-    if SIGCHLD_READER.get().is_some() {
-        return Ok(());
+#[derive(Debug)]
+pub struct Waiter {
+    original_signal_marker: Arc<u8>,
+}
+
+impl Waiter {
+    /// Create a `Waiter`.
+    ///
+    /// Any `SIGCHLD` signals that arrive after a `Waiter` is created, but before a call to
+    /// [`wait`](Self::wait), [`wait_timeout`](Self::wait_timeout), or
+    /// [`wait_deadline`](Self::wait_deadline), will be buffered. In that case the next call to one
+    /// of those methods will return immediately.
+    pub fn new() -> Result<Self> {
+        let mut state_guard = lock_no_poison(&STATE);
+
+        // The first time we get here, open the pipe and register the signal handler. Holding the
+        // state lock guarantees that only one thread does this. (This is similar to
+        // OnceLock::get_or_init, but that method makes it harder to return errors.)
+        if SIGCHLD_READER.get().is_none() {
+            // We could use a regular pipe instead of a Unix socket, but the standard library
+            // provides `set_nonblocking` for sockets, which saves us an unsafe libc call. The
+            // socket is bidirectional, but we'll only ever write in one direction.
+            let (reader, writer) = UnixStream::pair()?;
+            reader.set_nonblocking(true)?;
+            writer.set_nonblocking(true)?;
+            signal_hook::low_level::pipe::register(signal_hook::consts::SIGCHLD, writer)?;
+            SIGCHLD_READER.set(reader).expect("only 1 thread gets here");
+        }
+
+        // If no other thread is currently polling the reader, drain it. This means we won't wake
+        // up immediately for signals that were delivered before this Waiter was created. Again
+        // it's important that we're holding the state lock while we do this.
+        if !state_guard.someone_is_polling {
+            drain_sigchld_reader(&mut state_guard)?;
+            // There can't be anyone sleeping on the condvar at this point, no need to notify.
+        }
+
+        Ok(Self {
+            original_signal_marker: Arc::clone(&state_guard.signal_marker),
+        })
     }
 
-    // Take the state mutex, so that only one thread tries to initialize the pipe at a time. We
-    // don't want the mutex to own the reader, though, because many threads threads need to be able
-    // to observe the state while one thread blocks on the reader.
-    let _guard = STATE.lock().unwrap();
-
-    // Check again, because two threads could've raced to take the lock.
-    if SIGCHLD_READER.get().is_some() {
-        return Ok(());
+    /// Block the current thread until any `SIGCHLD` signal arrives.
+    ///
+    /// If any `SIGCHLD` signals have arrived since the `Waiter` was created, this function will
+    /// return immediately. This avoids a race condition where the child exits right after you call
+    /// [`Child::try_wait`] but right before you call this function.
+    ///
+    /// This function does not reap any exited children. Child process cleanup is only done by
+    /// [`Child::wait`] or [`Child::try_wait`].
+    ///
+    /// This function is not currently susceptible to "spurious wakeups" (i.e. returning early for
+    /// no reason), but this property isn't guaranteed, and future versions might be. Getting woken
+    /// up early by an unrelated child process exiting (e.g. one spawned by some unknown library
+    /// code running on another thread) is similar to a spurious wakeup, and you might need to be
+    /// defensive and wait in a loop either way.
+    ///
+    /// [`Child::wait`]: https://doc.rust-lang.org/std/process/struct.Child.html#method.wait
+    /// [`Child::try_wait`]: https://doc.rust-lang.org/std/process/struct.Child.html#method.try_wait
+    pub fn wait(self) -> Result<()> {
+        let signaled = self.wait_inner(None)?;
+        debug_assert!(signaled, "timeout shouldn't be possible");
+        Ok(())
     }
 
-    // Open and register the pipe. We could use a regular pipe instead of a Unix socket, but the
-    // standard library provides `set_nonblocking` for sockets, which saves us an unsafe libc call.
-    // The socket is bidirectional, but we'll only ever write in one direction.
-    let (reader, writer) = UnixStream::pair()?;
-    reader.set_nonblocking(true)?;
-    writer.set_nonblocking(true)?;
-    signal_hook::low_level::pipe::register(signal_hook::consts::SIGCHLD, writer)?;
-    SIGCHLD_READER.set(reader).expect("only 1 thread gets here");
-    Ok(())
-}
+    /// Block the current thread until either any `SIGCHLD` signal arrives or a timeout passes.
+    /// Return `true` if a signal arrived before the timeout.
+    ///
+    /// If any `SIGCHLD` signals have arrived since the `Waiter` was created, this function will
+    /// return immediately. This avoids a race condition where the child exits right after you call
+    /// [`Child::try_wait`] but right before you call this function.
+    ///
+    /// This function does not reap any exited children. Child process cleanup is only done by
+    /// [`Child::wait`] or [`Child::try_wait`].
+    ///
+    /// This function is not currently susceptible to "spurious wakeups" (i.e. returning early for
+    /// no reason), but this property isn't guaranteed, and future versions might be. Getting woken
+    /// up early by an unrelated child process exiting (e.g. one spawned by some unknown library
+    /// code running on another thread) is similar to a spurious wakeup, and you might need to be
+    /// defensive and wait in a loop either way.
+    ///
+    /// [`Child::wait`]: https://doc.rust-lang.org/std/process/struct.Child.html#method.wait
+    /// [`Child::try_wait`]: https://doc.rust-lang.org/std/process/struct.Child.html#method.try_wait
+    pub fn wait_timeout(self, timeout: Duration) -> Result<bool> {
+        let deadline = Instant::now() + timeout;
+        self.wait_inner(Some(deadline))
+    }
 
-/// Block the current thread until either any `SIGCHLD` signal arrives.
-///
-/// Signals are buffered, and this function will return immediately if any signals have arrived
-/// since the last time it was called, even if that was a long time ago. Spurious wakeups are also
-/// possible. For both those reasons, you usually need to call this in a loop and poll your child
-/// process each time it returns.
-///
-/// This function does not reap any exited children. Child process cleanup is only done by
-/// [`Child::wait`] or [`Child::try_wait`].
-///
-/// # Panics
-///
-/// You must call [`init`] at least once before you call this function. If [`init`] has not been
-/// called, this function panics.
-///
-/// [`Child::wait`]: https://doc.rust-lang.org/std/process/struct.Child.html#method.wait
-/// [`Child::try_wait`]: https://doc.rust-lang.org/std/process/struct.Child.html#method.try_wait
-pub fn wait() -> Result<()> {
-    let signaled = wait_inner(None)?;
-    debug_assert!(signaled, "timeout shouldn't be possible");
-    Ok(())
-}
+    /// Block the current thread until either any `SIGCHLD` signal arrives or a deadline passes.
+    /// Return `true` if a signal arrived before the deadline.
+    ///
+    /// If any `SIGCHLD` signals have arrived since the `Waiter` was created, this function will
+    /// return immediately. This avoids a race condition where the child exits right after you call
+    /// [`Child::try_wait`] but right before you call this function.
+    ///
+    /// This function does not reap any exited children. Child process cleanup is only done by
+    /// [`Child::wait`] or [`Child::try_wait`].
+    ///
+    /// This function is not currently susceptible to "spurious wakeups" (i.e. returning early for
+    /// no reason), but this property isn't guaranteed, and future versions might be. Getting woken
+    /// up early by an unrelated child process exiting (e.g. one spawned by some unknown library
+    /// code running on another thread) is similar to a spurious wakeup, and you might need to be
+    /// defensive and wait in a loop either way.
+    ///
+    /// [`Child::wait`]: https://doc.rust-lang.org/std/process/struct.Child.html#method.wait
+    /// [`Child::try_wait`]: https://doc.rust-lang.org/std/process/struct.Child.html#method.try_wait
+    pub fn wait_deadline(self, deadline: Instant) -> Result<bool> {
+        self.wait_inner(Some(deadline))
+    }
 
-/// Block the current thread until either any `SIGCHLD` signal arrives or a timeout passes. Returns
-/// `true` if a signal arrived before the timeout.
-///
-/// Signals are buffered, and this function will return immediately if any signals have arrived
-/// since the last time it was called, even if that was a long time ago. Spurious wakeups are also
-/// possible. For both those reasons, you usually need to call this in a loop and poll your child
-/// process each time it returns. [`wait_deadline`] can be more convenient, since you don't need to
-/// decrement your timeout each time through the loop.
-///
-/// This function does not reap any exited children. Child process cleanup is only done by
-/// [`Child::wait`] or [`Child::try_wait`].
-///
-/// # Panics
-///
-/// You must call [`init`] at least once before you call this function. If [`init`] has not been
-/// called, this function panics.
-///
-/// [`Child::wait`]: https://doc.rust-lang.org/std/process/struct.Child.html#method.wait
-/// [`Child::try_wait`]: https://doc.rust-lang.org/std/process/struct.Child.html#method.try_wait
-pub fn wait_timeout(timeout: Duration) -> Result<bool> {
-    let deadline = Instant::now() + timeout;
-    wait_inner(Some(deadline))
-}
+    fn wait_inner(self, maybe_deadline: Option<Instant>) -> Result<bool> {
+        let mut state_guard = lock_no_poison(&STATE);
+        loop {
+            // Check the signal count. If it's changed, another thread has observed SIGCHLD, and we
+            // should return.
+            if !Arc::ptr_eq(&self.original_signal_marker, &state_guard.signal_marker) {
+                return Ok(true); // Another thread observed a signal.
+            }
 
-/// Block the current thread until either any `SIGCHLD` signal arrives or a deadline passes.
-/// Returns `true` if a signal arrived before the deadline.
-///
-/// Signals are buffered, and this function will return immediately if any signals have arrived
-/// since the last time it was called, even if that was a long time ago. Spurious wakeups are also
-/// possible. For both those reasons, you usually need to call this in a loop and poll your child
-/// process each time it returns.
-///
-/// This function does not reap any exited children. Child process cleanup is only done by
-/// [`Child::wait`] or [`Child::try_wait`].
-///
-/// # Panics
-///
-/// You must call [`init`] at least once before you call this function. If [`init`] has not been
-/// called, this function panics.
-///
-/// [`Child::wait`]: https://doc.rust-lang.org/std/process/struct.Child.html#method.wait
-/// [`Child::try_wait`]: https://doc.rust-lang.org/std/process/struct.Child.html#method.try_wait
-pub fn wait_deadline(deadline: Instant) -> Result<bool> {
-    wait_inner(Some(deadline))
-}
+            // If another thread is already polling the SIGCHLD_READER, wait for them to wake us
+            // up. Note that if there wasn't already a polling thread, we'd do at least one
+            // non-blocking check for buffered signals, even if our timeout was zero / our deadline
+            // was in the past. Since `someone_is_polling` is set, we rely on the polling thread to
+            // have done that check *before* releasing the state lock. This sort of issue comes up
+            // every single time I use a condvar, and in my head it's "the condvar footgun".
+            if state_guard.someone_is_polling {
+                if let Some(deadline) = maybe_deadline {
+                    let timeout = deadline.saturating_duration_since(Instant::now());
+                    let (returned_guard, timeout_result) =
+                        CONDVAR.wait_timeout(state_guard, timeout).unwrap();
+                    state_guard = returned_guard;
+                    if timeout_result.timed_out() {
+                        return Ok(false); // We timed out.
+                    }
+                } else {
+                    state_guard = CONDVAR.wait(state_guard).unwrap();
+                }
+                // Go back to the top of the loop to re-check the signal count. If the polling
+                // thread timed out, it's also possible that we might become the polling thread.
+                continue;
+            }
 
-fn wait_inner(maybe_deadline: Option<Instant>) -> Result<bool> {
-    let mut guard = STATE.lock().unwrap();
-    if matches!(*guard, State::SomeoneIsWaiting) {
-        // Another thread is already blocking on SIGCHLD_READER. Wait for them to wake us up.
-        // Spurious wakeups are allowed, so we don't need to do this in a loop.
-        if let Some(deadline) = maybe_deadline {
-            let timeout = deadline.saturating_duration_since(Instant::now());
-            let (guard, timeout_result) = CONDVAR.wait_timeout(guard, timeout).unwrap();
-            drop(guard); // silence warnings
-            return Ok(!timeout_result.timed_out());
-        } else {
-            let guard = CONDVAR.wait(guard).unwrap();
-            drop(guard); // silence warnings
-            return Ok(true);
+            // We're the thread that needs to poll the SIGCHLD_READER.
+            return poll_sigchld_reader(maybe_deadline, state_guard);
         }
     }
+}
 
-    // We're the thread that needs to poll SIGCHLD_READER. Set the SomeoneIsWaiting state while we
-    // do this, and unlock the state mutex so that other threads can observe the state in the
-    // meantime. After doing this, we *must* unset the state before exiting. No short-circuiting
-    // with io errors.
-    *guard = State::SomeoneIsWaiting;
-    drop(guard);
+fn poll_sigchld_reader(
+    maybe_deadline: Option<Instant>,
+    mut state_guard: MutexGuard<State>,
+) -> Result<bool> {
+    // "The condvar footgun": We must do a non-blocking check for our exit condition *before* we
+    // release the guard, otherwise other threads might interpret someone_is_waiting to mean that
+    // the condition is false, when in fact it would be true if they checked it themselves.
+    debug_assert!(!state_guard.someone_is_polling);
+    let signaled = drain_sigchld_reader(&mut state_guard)?;
+    if signaled {
+        // There can't be anyone sleeping on the condvar at this point, no need to notify.
+        return Ok(true);
+    }
 
-    // The real work happens here. We can't short-circuit in this critical section.
-    let wait_result = wait_short_circuitable(maybe_deadline);
+    // There were no pending signals. Now we can change the state and release the guard while we
+    // poll. All the fallible IO happens here, but we can't short-circuit in this critical section,
+    // because we must reset the state at the end.
+    state_guard.someone_is_polling = true;
 
-    // Regardless of whether wait_inner succeeded or failed, reacquire the state mutex, exit the
-    // SomeoneIsWaiting state, and wake up everyone who's sleeping on the condvar.
-    guard = STATE.lock().unwrap();
-    *guard = State::NoOneIsWaiting;
+    let wait_result = poll_sigchld_reader_inner(maybe_deadline, state_guard);
+
+    // Regardless of whether wait_inner succeeded or failed, reacquire the state mutex, unset
+    // `someone_is_waiting`, and wake any threads that are sleeping on the condvar. If we timed
+    // out, one of them will take over as the polling thread.
+    state_guard = lock_no_poison(&STATE);
+    state_guard.someone_is_polling = false;
     CONDVAR.notify_all();
     wait_result
 }
 
 // Within this function we can short-circuit. The caller manages state cleanup.
-fn wait_short_circuitable(maybe_deadline: Option<Instant>) -> Result<bool> {
-    let mut reader = SIGCHLD_READER.get().expect("you must call init first");
+fn poll_sigchld_reader_inner(
+    maybe_deadline: Option<Instant>,
+    mut state_guard: MutexGuard<State>,
+) -> Result<bool> {
+    let reader = SIGCHLD_READER.get().expect("already initialized");
     // Wait until the pipe is readable or the deadline passes.
-    let mut poll_fd = libc::pollfd {
-        fd: reader.as_raw_fd(),
-        events: libc::POLLIN,
-        revents: 0,
-    };
     loop {
+        let mut poll_fd = libc::pollfd {
+            fd: reader.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
         let timeout_ms: c_int = if let Some(deadline) = maybe_deadline {
             let timeout = deadline.saturating_duration_since(Instant::now());
             // Convert to milliseconds, rounding *up*. (That way we don't repeatedly sleep for 0ms
@@ -247,6 +314,8 @@ fn wait_short_circuitable(maybe_deadline: Option<Instant>) -> Result<bool> {
         } else {
             -1 // infinite timeout
         };
+        // Release the state lock while polling and reacquire it afterwards.
+        drop(state_guard);
         let error_code = unsafe {
             libc::poll(
                 &mut poll_fd, // an "array" of one
@@ -254,6 +323,7 @@ fn wait_short_circuitable(maybe_deadline: Option<Instant>) -> Result<bool> {
                 timeout_ms,
             )
         };
+        state_guard = lock_no_poison(&STATE);
         if error_code < 0 {
             // EINTR is expected here. If we're the only running thread, then we're the only thread
             // that can handle SIGCHLD, so it's probably even guaranteed. We don't *have* to loop,
@@ -267,31 +337,52 @@ fn wait_short_circuitable(maybe_deadline: Option<Instant>) -> Result<bool> {
                 return Err(io::Error::last_os_error().into());
             }
         }
-        // Read the pipe until EWOULDBLOCK. This could take more than one read.
-        let mut buf = [0u8; 1024];
-        let mut did_read_anything = false;
-        loop {
-            match reader.read(&mut buf) {
-                Ok(0) => unreachable!("this pipe should never close"),
-                Ok(_) => did_read_anything = true,
-                Err(e) if e.kind() == ErrorKind::WouldBlock => break,
-                // EINTR should not be possible for a nonblocking read.
-                #[allow(clippy::useless_conversion)]
-                Err(e) => return Err(e.into()),
-            }
-        }
-        // If we read anything, we were signaled, and we should return. If not, check the clock to
-        // see if we've timed out. Otherwise keep looping.
-        if did_read_anything {
-            // A signal arrived.
+        // Read signal bytes out of the pipe.
+        let signaled = drain_sigchld_reader(&mut state_guard)?;
+        // If we were signaled, return.
+        if signaled {
             return Ok(true);
-        } else if let Some(deadline) = maybe_deadline {
+        }
+        // Check the clock to see if we've timed out.
+        if let Some(deadline) = maybe_deadline {
             if Instant::now() > deadline {
-                // The deadline passed.
                 return Ok(false);
             }
         }
         // Otherwise we must've woken up spuriously. Keep looping.
+    }
+}
+
+// Read the SIGCHLD pipe until EOF and return true (signaled) if anything was in it. In that case
+// also increment the signal_count.
+fn drain_sigchld_reader(state: &mut State) -> Result<bool> {
+    let mut reader = SIGCHLD_READER.get().expect("already initialized");
+    // Read the pipe until EWOULDBLOCK. This could take more than one read.
+    let mut buf = [0u8; 1024];
+    let mut signaled = false;
+    loop {
+        match reader.read(&mut buf) {
+            Ok(0) => unreachable!("this pipe should never close"),
+            Ok(_) => signaled = true,
+            Err(e) if e.kind() == ErrorKind::WouldBlock => break,
+            // EINTR shouldn't be possible for a nonblocking read.
+            #[allow(clippy::useless_conversion)]
+            Err(e) => return Err(e.into()),
+        }
+    }
+    if signaled {
+        // If we were signaled, replace the marker. This is guaranteed to be a different heap
+        // address than any marker clone saved by any still-existing waiter. The numerical value
+        // doesn't matter.
+        state.signal_marker = Arc::new(42);
+    }
+    Ok(signaled)
+}
+
+fn lock_no_poison<T>(mutex: &Mutex<T>) -> MutexGuard<T> {
+    match mutex.lock() {
+        Ok(guard) => guard,
+        Err(e) => e.into_inner(),
     }
 }
 
@@ -304,6 +395,11 @@ mod test {
 
     // We need to make sure only one test runs at a time, because these waits are global, and
     // they'll confuse each other. Use a parking_lot mutex so that it doesn't get poisoned.
+    //
+    // XXX: These tests don't wait in a loop, because if there are bugs here that cause early
+    // wakeups, I'd rather the tests fail than hide the bug. I expect these tests will "randomly"
+    // fail under certain circumstances, and that's worth it to me to catch more bugs. But real
+    // callers should wait in a loop so that they don't randomly fail.
     static ONE_TEST_AT_A_TIME: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
 
     #[track_caller]
@@ -320,12 +416,12 @@ mod test {
 
     #[test]
     fn test_wait() -> Result<()> {
-        init()?; // Make all tests race to init, why not.
         let _test_guard = ONE_TEST_AT_A_TIME.lock();
         let start = Instant::now();
 
+        let waiter = Waiter::new()?;
         cmd!("sleep", "0.25").start()?;
-        wait()?;
+        waiter.wait()?;
         let dur = Instant::now() - start;
         assert_approx_eq(Duration::from_millis(250), dur);
 
@@ -334,20 +430,21 @@ mod test {
 
     #[test]
     fn test_wait_deadline() -> Result<()> {
-        init()?; // Make all tests race to init, why not.
         let _test_guard = ONE_TEST_AT_A_TIME.lock();
         let start = Instant::now();
 
-        cmd!("sleep", "0.25").start()?;
         let timeout = Duration::from_millis(500);
+        let waiter = Waiter::new()?;
+        cmd!("sleep", "0.25").start()?;
         // This first wait should return true.
-        let signaled = wait_deadline(Instant::now() + timeout)?;
+        let signaled = waiter.wait_deadline(Instant::now() + timeout)?;
         let dur = Instant::now() - start;
         assert_approx_eq(Duration::from_millis(250), dur);
         assert!(signaled);
 
         // This second wait should time out and return false.
-        let signaled2 = wait_deadline(Instant::now() + timeout)?;
+        let waiter2 = Waiter::new()?;
+        let signaled2 = waiter2.wait_deadline(Instant::now() + timeout)?;
         let dur2 = Instant::now() - start;
         assert_approx_eq(Duration::from_millis(750), dur2);
         assert!(!signaled2);
@@ -357,20 +454,21 @@ mod test {
 
     #[test]
     fn test_wait_timeout() -> Result<()> {
-        init()?; // Make all tests race to init, why not.
         let _test_guard = ONE_TEST_AT_A_TIME.lock();
         let start = Instant::now();
 
-        cmd!("sleep", "0.25").start()?;
         let timeout = Duration::from_millis(500);
+        let waiter = Waiter::new()?;
+        cmd!("sleep", "0.25").start()?;
         // This first wait should return true.
-        let signaled = wait_timeout(timeout)?;
+        let signaled = waiter.wait_timeout(timeout)?;
         let dur = Instant::now() - start;
         assert_approx_eq(Duration::from_millis(250), dur);
         assert!(signaled);
 
         // This second wait should time out and return false.
-        let signaled2 = wait_timeout(timeout)?;
+        let waiter2 = Waiter::new()?;
+        let signaled2 = waiter2.wait_timeout(timeout)?;
         let dur2 = Instant::now() - start;
         assert_approx_eq(Duration::from_millis(750), dur2);
         assert!(!signaled2);
@@ -380,7 +478,6 @@ mod test {
 
     #[test]
     fn test_wait_many_threads() -> Result<()> {
-        init()?; // Make all tests race to init, why not.
         let _test_guard = ONE_TEST_AT_A_TIME.lock();
         let start = Instant::now();
 
@@ -388,23 +485,26 @@ mod test {
         let mut wait_threads = Vec::new();
         let mut short_timeout_threads = Vec::new();
         let mut long_timeout_threads = Vec::new();
-        for _ in 0..4 {
+        for _ in 0..3 {
             let handle_clone = handle.clone();
+            let waiter = Waiter::new()?;
             wait_threads.push(std::thread::spawn(move || -> Result<Duration> {
-                wait()?;
+                waiter.wait()?;
                 let dur = Instant::now() - start;
                 assert!(handle_clone.try_wait()?.is_some(), "should've exited");
                 Ok(dur)
             }));
             let handle_clone = handle.clone();
+            let waiter = Waiter::new()?;
             short_timeout_threads.push(std::thread::spawn(move || -> Result<bool> {
-                let signaled = wait_timeout(Duration::from_millis(500))?;
+                let signaled = waiter.wait_timeout(Duration::from_millis(500))?;
                 assert!(handle_clone.try_wait()?.is_none(), "shouldn't have exited");
                 Ok(signaled)
             }));
             let handle_clone = handle.clone();
+            let waiter = Waiter::new()?;
             long_timeout_threads.push(std::thread::spawn(move || -> Result<bool> {
-                let signaled = wait_timeout(Duration::from_millis(1500))?;
+                let signaled = waiter.wait_timeout(Duration::from_millis(1500))?;
                 assert!(handle_clone.try_wait()?.is_some(), "should've exited");
                 Ok(signaled)
             }));

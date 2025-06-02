@@ -45,10 +45,17 @@
 //! [`signal_hook`]: https://docs.rs/signal-hook
 //! [try_wait]: https://doc.rust-lang.org/std/process/struct.Child.html#method.try_wait
 
-use std::ffi::c_int;
-use std::io::{self, ErrorKind, PipeReader, Read};
-use std::os::fd::AsRawFd;
+use std::io::{self, ErrorKind, Read};
+use std::os::raw::c_int;
+use std::os::unix::io::AsRawFd;
 use std::time::{Duration, Instant};
+
+// `os_pipe` predates `std::io::pipe`, and they have almost the exact same API. Taking the
+// dependency reduces the MSRV from 1.87 to 1.63 (inherited from `libc`).
+#[cfg(feature = "os_pipe")]
+use os_pipe::{pipe, PipeReader};
+#[cfg(not(feature = "os_pipe"))]
+use std::io::{pipe, PipeReader};
 
 // Use anyhow errors in testing, for backtraces.
 #[cfg(test)]
@@ -132,7 +139,7 @@ impl Waiter {
     /// a single wakeup could indicate that multiple signals arrived. In other words, signals can
     /// be "coalesced".
     pub fn new() -> Result<Self> {
-        let (reader, writer) = std::io::pipe()?;
+        let (reader, writer) = pipe()?;
         set_nonblocking(&reader)?;
         set_nonblocking(&writer)?;
         let sig_id = signal_hook::low_level::pipe::register(libc::SIGCHLD, writer)?;

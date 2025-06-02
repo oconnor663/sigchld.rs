@@ -19,8 +19,11 @@ jobs:
       fail-fast: false
       matrix:
         os: ["ubuntu-latest", "macOS-latest"]
-        rust_channel: [stable, beta, nightly]
-
+        rust_channel:
+          - stable
+          - beta
+          - nightly
+          - 1.70 # The real MSRV is 1.63 (inherited from libc) but tests require 1.70. Close enough, honestly.
     steps:
     - uses: actions/checkout@v4
     - uses: dtolnay/rust-toolchain@master

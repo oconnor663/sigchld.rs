@@ -1,6 +1,6 @@
 [package]
 name = "sigchld"
-version = "0.2.1"
+version = "0.2.2"
 authors = ["Jack O'Connor"]
 description = "waiting for SIGCHLD from many threads at once"
 repository = "https://github.com/oconnor663/sigchld.rs"

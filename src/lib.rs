@@ -10,8 +10,8 @@
 //! Note that `SIGCHLD` indicates that _any_ child process has exited, but there's no (100%
 //! reliable) way to know _which_ child it was. You generally need to [poll your child
 //! process][try_wait] in a loop, and wait again if it hasn't exited yet. Most applications will
-//! want a higher-level crate that does this loop internally; I'll list such crates here as they're
-//! implemented.
+//! want to use a higher-level API that does this loop internally; I'll list such crates here as
+//! they're implemented.
 //!
 //! \* Linux supports `signalfd`, but there's no equivalent on e.g. macOS.
 //!
@@ -20,24 +20,15 @@
 //! ```rust
 //! # fn main() -> std::io::Result<()> {
 //! # use std::time::Duration;
-//! // Create a waiter before spawning the child, to guarantee that we don't miss a signal.
 //! let mut waiter = sigchld::Waiter::new()?;
-//!
-//! // Start a child process that sleeps for up to a second.
-//! let sleep_time: f32 = rand::random_range(0.0..=1.0);
-//! println!("Sleeping for {sleep_time:.3} seconds...", );
-//! std::process::Command::new("sleep").arg(format!("{sleep_time}")).spawn()?;
-//!
-//! // Wait half a second for *any* child to exit. In this example `sleep` is the only child
-//! // process, but in general we won't necessarily know which child woke us up.
-//! let signaled: bool = waiter.wait_timeout(Duration::from_millis(500))?;
-//!
-//! if signaled {
-//!     // In *this example* we know that the signal came from `sleep`.
-//!     println!("Sleep exited.");
-//! } else {
-//!     println!("Our 500 ms wait timed out.");
-//! }
+//! // Any SIGCHLD after this point will be buffered by the Waiter.
+//! let mut child = std::process::Command::new("sleep").arg("1").spawn()?;
+//! // Block until *any* child exits. See also `wait_timeout` and `wait_deadline`.
+//! waiter.wait()?;
+//! // There's only one child process in this example, so we know that it exited. But in general
+//! // we might not know which child woke us up, and then we'd need to wait and check in a loop.
+//! // See the Waiter examples.
+//! assert!(child.try_wait()?.is_some(), "sleep has exited");
 //! # Ok(())
 //! # }
 //! ```
@@ -66,45 +57,47 @@ type Result<T> = io::Result<T>;
 /// An object that buffers `SIGCHLD` signals so that you can wait on them reliably.
 ///
 /// `Waiter` can't tell you _which_ process woke you up, so you usually need to wait in a loop and
-/// poll your [`Child`] each time through. The most reliable way to make sure you don't miss a
-/// signal (and potentially wait forever) is to create a `Waiter` before you spawn your child
-/// process, like this:
+/// [poll your `Child`][try_wait] each time through. The most reliable way to make sure you don't
+/// miss a signal (and potentially wait forever) is to create a `Waiter` before you spawn your
+/// child process, like this:
 ///
 /// ```
 /// # use std::io;
 /// # fn main() -> io::Result<()> {
 /// let mut waiter = sigchld::Waiter::new()?;
-/// // Any SIGCHLD after this point will be received by the Waiter.
+/// // Any SIGCHLD after this point will be buffered by the Waiter.
 /// let mut child = std::process::Command::new("sleep").arg("1").spawn()?;
 /// loop {
 ///     waiter.wait()?;
-///     // Some child has exited. Check whether it was our child.
+///     // *Some* child has exited. Check whether it was our child.
 ///     if child.try_wait()?.is_some() {
-///         break; // Our child has exited.
+///         break;
 ///     }
 /// }
+/// // Our child has exited.
 /// # Ok(())
 /// # }
 /// ```
 ///
-/// If you create a `Waiter` after your child is already spawned, you need to poll the child before
+/// If you create a `Waiter` after your child is already running, you need to poll the child before
 /// waiting:
 ///
 /// ```
 /// # use std::io;
 /// # fn main() -> io::Result<()> {
 /// let mut child = std::process::Command::new("sleep").arg("1").spawn()?;
-/// // If SIGCHLD arrives now, before the Waiter is created, we could miss it.
+/// // If SIGCHLD arrives here, before the Waiter is created, we could miss it.
 /// let mut waiter = sigchld::Waiter::new()?;
 /// while child.try_wait()?.is_none() {
-///     // The child is still running, so we know we didn't miss SIGCHLD.
+///     // Now we know the child didn't exit before we created the Waiter.
 ///     waiter.wait()?;
 /// }
+/// // Our child has exited.
 /// # Ok(())
 /// # }
 /// ```
 ///
-/// But the following order of operations is broken. We could miss SIGCHLD and wait forever:
+/// But the following order of operations is broken. We could miss `SIGCHLD` and wait forever:
 ///
 /// <div class="warning">
 ///
@@ -122,7 +115,7 @@ type Result<T> = io::Result<T>;
 ///
 /// </div>
 ///
-/// [`Child`]: https://doc.rust-lang.org/std/process/struct.Child.html
+/// [try_wait]: https://doc.rust-lang.org/std/process/struct.Child.html#method.try_wait
 #[derive(Debug)]
 pub struct Waiter {
     reader: PipeReader,

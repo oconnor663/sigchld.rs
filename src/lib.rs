@@ -317,7 +317,7 @@ mod test {
     // callers should wait in a loop so that they don't randomly fail.
     static ONE_TEST_AT_A_TIME: Mutex<()> = Mutex::new(());
 
-    fn lock_no_poison<T>(mutex: &Mutex<T>) -> MutexGuard<T> {
+    fn lock_no_poison<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
         match mutex.lock() {
             Ok(guard) => guard,
             Err(e) => e.into_inner(),

@@ -13,7 +13,11 @@
 //! want to use a higher-level API that does this loop internally; I'll list such crates here as
 //! they're implemented.
 //!
-//! \* Linux supports `signalfd`, but there's no equivalent on e.g. macOS.
+//! This crate only supports Unix and doesn't build on Windows. Portable callers need to put this
+//! crate in the `[target.'cfg(unix)'.dependencies]` section of their `Cargo.toml` and only use it
+//! inside of `#[cfg(unix)]` blocks or similar.
+//!
+//! <div style="font-size: smaller">* Linux supports `signalfd`, but there's no equivalent on e.g. macOS.</div>
 //!
 //! # Example
 //!
@@ -35,6 +39,11 @@
 //!
 //! [`signal_hook`]: https://docs.rs/signal-hook
 //! [try_wait]: https://doc.rust-lang.org/std/process/struct.Child.html#method.try_wait
+
+#[cfg(not(unix))]
+compile_error!(
+    "This crate is Unix-only. Put it in [target.'cfg(unix)'.dependencies] in Cargo.toml."
+);
 
 use std::io::{self, ErrorKind, Read};
 use std::os::raw::c_int;

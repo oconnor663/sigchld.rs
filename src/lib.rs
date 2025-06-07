@@ -266,10 +266,7 @@ impl Waiter {
                 )
             };
             if poll_return_code < 0 {
-                // EINTR is expected here. If we're the only running thread, then we're the only
-                // thread that can handle SIGCHLD, so it's probably even guaranteed. We don't
-                // *have* to loop, because spurious wakeups are allowed, but it would be bad
-                // behavior to wake the caller for unrelated signals.
+                // EINTR is expected here, and the delivery of SIGCHLD usually causes it.
                 let last_error = io::Error::last_os_error();
                 if last_error.kind() != ErrorKind::Interrupted {
                     #[allow(clippy::useless_conversion)]

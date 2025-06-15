@@ -13,6 +13,8 @@
 //! want to use a higher-level API that does this loop internally; I'll list such crates here as
 //! they're implemented.
 //!
+//! - [`shared_child`](https://docs.rs/shared_child) as of v1.1.0. See [`wait_timeout`] and [`wait_deadline`].
+//!
 //! This crate only supports Unix and doesn't build on Windows. Portable callers need to put this
 //! crate in the `[target.'cfg(unix)'.dependencies]` section of their `Cargo.toml` and only use it
 //! inside of `#[cfg(unix)]` blocks or similar.
@@ -39,6 +41,8 @@
 //!
 //! [`signal_hook`]: https://docs.rs/signal-hook
 //! [try_wait]: https://doc.rust-lang.org/std/process/struct.Child.html#method.try_wait
+//! [`wait_timeout`]: https://docs.rs/shared_child/latest/shared_child/struct.SharedChild.html#method.wait_timeout
+//! [`wait_deadline`]: https://docs.rs/shared_child/latest/shared_child/struct.SharedChild.html#method.wait_deadline
 
 #[cfg(not(unix))]
 compile_error!(

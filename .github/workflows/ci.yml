@@ -23,7 +23,7 @@ jobs:
           - stable
           - beta
           - nightly
-          - 1.70 # The real MSRV is 1.63 (inherited from libc) but tests require 1.70. Close enough, honestly.
+          - 1.74 # The real MSRV is 1.63 (inherited from libc) but tests require 1.74.
     steps:
     - uses: actions/checkout@v4
     - uses: dtolnay/rust-toolchain@master

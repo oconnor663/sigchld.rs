@@ -224,6 +224,12 @@ impl Waiter {
     fn wait_inner(&mut self, maybe_deadline: Option<Instant>) -> Result<bool> {
         // Loop to handle spurious wakeups from poll().
         loop {
+            // This order of operations...
+            //   1. Read the clock.
+            //   2. Check the pipe.
+            //   3. Enforce the deadline.
+            // ...makes us more robust to random scheduler delays between step 2 and step 3.
+            let now = Instant::now();
             // Read the pipe until EWOULDBLOCK. This could take more than one read.
             let mut buf = [0u8; 1024];
             let mut signaled = false;
@@ -243,7 +249,7 @@ impl Waiter {
             }
             // If the deadline has passed, return false.
             if let Some(deadline) = maybe_deadline {
-                if Instant::now() > deadline {
+                if now > deadline {
                     return Ok(false);
                 }
             }

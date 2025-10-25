@@ -20,6 +20,9 @@ duct = "1.0.0"
 rand = "0.9.1"
 
 [features]
+# By default we open pipes with `os_pipe::pipe()`, making the MSRV 1.63. If
+# that feature/dependency is turned off, we use `std::io::pipe()` instead,
+# making the MSRV 1.87. Eventually `std::io::pipe()` will become the default,
+# and the `os_pipe` feature will become a no-op retained only for back compat.
 default = ["os_pipe"]
-# Replacement for std::io::pipe. Without this, the MSRV is 1.63, inherited from libc.
 os_pipe = ["dep:os_pipe"]

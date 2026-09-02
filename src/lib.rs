@@ -357,10 +357,10 @@ mod test {
         let start = Instant::now();
 
         let mut waiter = Waiter::new()?;
-        cmd!("sleep", "0.25").start()?;
+        cmd!("sleep", "1").start()?;
         waiter.wait()?;
         let dur = Instant::now() - start;
-        assert_approx_eq(Duration::from_millis(250), dur);
+        assert_approx_eq(Duration::from_secs(1), dur);
 
         Ok(())
     }
@@ -370,20 +370,21 @@ mod test {
         let _test_guard = lock_no_poison(&ONE_TEST_AT_A_TIME); // see comment on the lock
         let start = Instant::now();
 
-        let timeout = Duration::from_millis(500);
+        let timeout = Duration::from_millis(1500);
         let mut waiter = Waiter::new()?;
-        cmd!("sleep", "0.25").start()?;
+        cmd!("sleep", "1").start()?;
         // This first wait should return true.
         let signaled = waiter.wait_deadline(Instant::now() + timeout)?;
         let dur = Instant::now() - start;
-        assert_approx_eq(Duration::from_millis(250), dur);
+        assert_approx_eq(Duration::from_secs(1), dur);
         assert!(signaled);
 
         // This second wait should time out and return false.
         let mut waiter2 = Waiter::new()?;
+        let start2 = Instant::now();
         let signaled2 = waiter2.wait_deadline(Instant::now() + timeout)?;
-        let dur2 = Instant::now() - start;
-        assert_approx_eq(Duration::from_millis(750), dur2);
+        let dur2 = Instant::elapsed(&start2);
+        assert_approx_eq(Duration::from_millis(1500), dur2);
         assert!(!signaled2);
 
         Ok(())
@@ -394,20 +395,21 @@ mod test {
         let _test_guard = lock_no_poison(&ONE_TEST_AT_A_TIME); // see comment on the lock
         let start = Instant::now();
 
-        let timeout = Duration::from_millis(500);
+        let timeout = Duration::from_millis(1500);
         let mut waiter = Waiter::new()?;
-        cmd!("sleep", "0.25").start()?;
+        cmd!("sleep", "1").start()?;
         // This first wait should return true.
         let signaled = waiter.wait_timeout(timeout)?;
         let dur = Instant::now() - start;
-        assert_approx_eq(Duration::from_millis(250), dur);
+        assert_approx_eq(Duration::from_secs(1), dur);
         assert!(signaled);
 
         // This second wait should time out and return false.
         let mut waiter2 = Waiter::new()?;
+        let start2 = Instant::now();
         let signaled2 = waiter2.wait_timeout(timeout)?;
-        let dur2 = Instant::now() - start;
-        assert_approx_eq(Duration::from_millis(750), dur2);
+        let dur2 = Instant::elapsed(&start2);
+        assert_approx_eq(Duration::from_millis(1500), dur2);
         assert!(!signaled2);
 
         Ok(())

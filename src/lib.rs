@@ -354,12 +354,12 @@ mod test {
     #[test]
     fn test_wait() -> Result<()> {
         let _test_guard = lock_no_poison(&ONE_TEST_AT_A_TIME); // see comment on the lock
-        let start = Instant::now();
 
         let mut waiter = Waiter::new()?;
         cmd!("sleep", "1").start()?;
+        let start = Instant::now();
         waiter.wait()?;
-        let dur = Instant::now() - start;
+        let dur = Instant::elapsed(&start);
         assert_approx_eq(Duration::from_secs(1), dur);
 
         Ok(())
@@ -368,14 +368,14 @@ mod test {
     #[test]
     fn test_wait_deadline() -> Result<()> {
         let _test_guard = lock_no_poison(&ONE_TEST_AT_A_TIME); // see comment on the lock
-        let start = Instant::now();
 
         let timeout = Duration::from_millis(1500);
         let mut waiter = Waiter::new()?;
         cmd!("sleep", "1").start()?;
         // This first wait should return true.
+        let start = Instant::now();
         let signaled = waiter.wait_deadline(Instant::now() + timeout)?;
-        let dur = Instant::now() - start;
+        let dur = Instant::elapsed(&start);
         assert_approx_eq(Duration::from_secs(1), dur);
         assert!(signaled);
 
@@ -393,14 +393,14 @@ mod test {
     #[test]
     fn test_wait_timeout() -> Result<()> {
         let _test_guard = lock_no_poison(&ONE_TEST_AT_A_TIME); // see comment on the lock
-        let start = Instant::now();
 
         let timeout = Duration::from_millis(1500);
         let mut waiter = Waiter::new()?;
         cmd!("sleep", "1").start()?;
         // This first wait should return true.
+        let start = Instant::now();
         let signaled = waiter.wait_timeout(timeout)?;
-        let dur = Instant::now() - start;
+        let dur = Instant::elapsed(&start);
         assert_approx_eq(Duration::from_secs(1), dur);
         assert!(signaled);
 
@@ -418,18 +418,18 @@ mod test {
     #[test]
     fn test_wait_many_threads() -> Result<()> {
         let _test_guard = lock_no_poison(&ONE_TEST_AT_A_TIME); // see comment on the lock
-        let start = Instant::now();
 
         let handle = Arc::new(cmd!("sleep", "1").start()?);
         let mut wait_threads = Vec::new();
         let mut short_timeout_threads = Vec::new();
         let mut long_timeout_threads = Vec::new();
+        let start = Instant::now();
         for _ in 0..3 {
             let handle_clone = handle.clone();
             let mut waiter = Waiter::new()?;
             wait_threads.push(std::thread::spawn(move || -> Result<Duration> {
                 waiter.wait()?;
-                let dur = Instant::now() - start;
+                let dur = Instant::elapsed(&start);
                 assert!(handle_clone.try_wait()?.is_some(), "should've exited");
                 Ok(dur)
             }));

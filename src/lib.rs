@@ -192,9 +192,15 @@ impl Waiter {
     /// code running on another thread) is similar to a spurious wakeup, and you might need to be
     /// defensive and wait in a loop either way.
     ///
+    /// # Panics
+    ///
+    /// Panics if `Instant::now() + timeout` overflows.
+    ///
     /// [`Child::wait`]: https://doc.rust-lang.org/std/process/struct.Child.html#method.wait
     /// [`Child::try_wait`]: https://doc.rust-lang.org/std/process/struct.Child.html#method.try_wait
     pub fn wait_timeout(&mut self, timeout: Duration) -> Result<bool> {
+        // `Instant` doesn't currently support saturating operations, so this addition can panic.
+        // See https://internals.rust-lang.org/t/instant-systemtime-min-max/21375.
         let deadline = Instant::now() + timeout;
         self.wait_inner(Some(deadline))
     }

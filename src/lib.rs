@@ -51,7 +51,7 @@ use std::os::unix::io::AsRawFd;
 use std::time::{Duration, Instant};
 
 // `os_pipe` predates `std::io::pipe`, and they have almost the exact same API. Taking the
-// dependency reduces the MSRV from 1.87 to 1.63 (inherited from `libc`).
+// dependency reduces the MSRV from 1.87 to 1.66 (inherited from `signal-hook`).
 #[cfg(feature = "os_pipe")]
 use os_pipe::{pipe, PipeReader};
 #[cfg(not(feature = "os_pipe"))]

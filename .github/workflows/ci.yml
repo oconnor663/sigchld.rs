@@ -23,7 +23,11 @@ jobs:
           - stable
           - beta
           - nightly
-          - 1.74 # The real MSRV is 1.63 (inherited from libc) but tests require 1.74.
+          # The real MSRV is 1.66 (inherited from signal-hook) but tests require 1.74.
+          # NOTE: Keep this in sync with the `if` condition below.
+          - 1.74
+          # The --no-default-features (no `os_pipe`) MSRV.
+          - 1.87
     steps:
     - uses: actions/checkout@v7
     - uses: dtolnay/rust-toolchain@master

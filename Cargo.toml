@@ -12,16 +12,17 @@ edition = "2021"
 [dependencies]
 libc = "0.2.172"
 os_pipe = { version = "1.2.2", optional = true }
-signal-hook = { version = "0.3.18", default-features = false }
+signal-hook = { version = "0.4.4", default-features = false }
 
 [dev-dependencies]
 anyhow = "1.0.98"
 duct = "1.0.0"
 
 [features]
-# By default we open pipes with `os_pipe::pipe()`, making the MSRV 1.63. If
-# that feature/dependency is turned off, we use `std::io::pipe()` instead,
-# making the MSRV 1.87. Eventually `std::io::pipe()` will become the default,
-# and the `os_pipe` feature will become a no-op retained only for back compat.
+# By default we open pipes with `os_pipe::pipe()`, and we inherit the
+# `signal-hook` MSRV of 1.66. If that feature/dependency is turned off, we use
+# `std::io::pipe()` instead, making the MSRV 1.87. Eventually `std::io::pipe()`
+# will become the default, and the `os_pipe` feature will become a no-op
+# retained only for back compat.
 default = ["os_pipe"]
 os_pipe = ["dep:os_pipe"]

@@ -267,8 +267,9 @@ impl Waiter {
             };
             let timeout_ms: c_int = if let Some(deadline) = maybe_deadline {
                 let timeout = deadline.saturating_duration_since(Instant::now());
-                // Convert to milliseconds, rounding *up*. (That way we don't repeatedly sleep for
-                // 0ms when we're close to the timeout.)
+                // Convert to milliseconds, rounding *up*. That way we don't repeatedly sleep for
+                // 0ms when we're close to the timeout. Note that `c_int` is signed, so
+                // `c_int::MAX` is not equal to -1.
                 (timeout.as_nanos().saturating_add(999_999) / 1_000_000)
                     .try_into()
                     .unwrap_or(c_int::MAX)

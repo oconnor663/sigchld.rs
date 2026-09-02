@@ -40,3 +40,5 @@ jobs:
       run: sudo sysctl -w kern.timer.coalescing_enabled=0
       if: matrix.os == 'macOS-latest'
     - run: cargo test
+    - run: cargo test --no-default-features
+      if: matrix.rust_channel != 1.74
